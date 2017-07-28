@@ -1,2 +1,4 @@
 # akka-persistence-jgit
-Such a crazy idea is to store akka snapshots as a commits in a Git repo
+The idea is to store akka snapshots as commits in a Git repo.
+
+The solution is going to use [JGit project](http://www.eclipse.org/jgit/) as a backend.
