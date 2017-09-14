@@ -24,12 +24,19 @@ class JgitSnapshotStore(config: Config) extends SnapshotStore with ActorLogging 
   private val maxLoadAttempts = config.getInt("max-load-attempts").requiring(_ > 1, "max-load-attempts must be >= 1")
 
   private val dir = new File(config.getString("dir"))
-  private val branchPrefix = new File(config.getString("branchPrefix"))
+  require(dir.isDirectory, s"Configured parameter `dir` = ${dir.getPath} should point to a directory")
+
+  if (true) {
+    // ensure we have repository initialized
+    org.eclipse.jgit.api.Git.init().setDirectory(dir).call()
+  }
+
+  private val branchPrefix = new File(config.getString("branch-prefix"))
   private val executionContext = context.system.dispatchers.lookup(config.getString("stream-dispatcher"))
   private val serializationExtension = SerializationExtension(context.system)
 
-  private val commiterName = "1"
-  private val commiterEMail = "1"
+  private val commiterName = config.getString("commiter.name")
+  private val commiterMail = config.getString("commiter.mail")
 
   private val ENTRY_NAME = "SNAPSHOT"
 
@@ -46,17 +53,19 @@ class JgitSnapshotStore(config: Config) extends SnapshotStore with ActorLogging 
   }
 
   override def deleteAsync(metadata: SnapshotMetadata): Future[Unit] = {
+    // TODO: git rebase?
     Future.successful() // DO NOTHING
   }
 
   override def deleteAsync(persistenceId: String, criteria: SnapshotSelectionCriteria): Future[Unit] = {
+    // TODO: git rebase?
     Future.successful() // DO NOTHING
   }
 
   @scala.annotation.tailrec
-  private def loadFirstSuccess(metadata: List[(String, SnapshotMetadata)]): Try[Option[SelectedSnapshot]] = metadata match {
-    case Nil => Success(None) // no snapshots stored
-    case (rev, md) :: remaining ⇒ {
+  private def loadFirstSuccess(metadata: Stream[(String, SnapshotMetadata)]): Try[Option[SelectedSnapshot]] = metadata match {
+    case Stream.Empty => Success(None) // no snapshots stored
+    case (rev, md) #:: remaining ⇒ {
       tryToLoad(md.persistenceId, rev)(deserialize) match {
         case Success(s) => Success(Some(SelectedSnapshot(md, s.data)))
         case Failure(e) => {
@@ -70,10 +79,10 @@ class JgitSnapshotStore(config: Config) extends SnapshotStore with ActorLogging 
 
   protected def save(metadata: SnapshotMetadata, snapshot: Any): Try[RefUpdate.Result] = withRepository { repo =>
     repo.commitBranchEntry(
-      branchName = branch(metadata.persistenceId), 
+      branchName = branch(metadata.persistenceId),
       entryName = ENTRY_NAME,
-      commiter = new PersonIdent(commiterName, commiterEMail, metadata.timestamp, SystemReader.getInstance.getTimezone(metadata.timestamp)),
-      message = s"[${metadata.sequenceNr}]: snapshot stored ${new Date(metadata.timestamp).toString}",
+      commiter = new PersonIdent(commiterName, commiterMail, metadata.timestamp, SystemReader.getInstance.getTimezone(metadata.timestamp)),
+      message = s"[${metadata.sequenceNr}]: Snapshot stored ${new Date(metadata.timestamp).toString}",
     )(bytes = serialize(Snapshot(snapshot)))
   }
 
@@ -86,7 +95,7 @@ class JgitSnapshotStore(config: Config) extends SnapshotStore with ActorLogging 
   private val commitMessage = """\[(\d+)\].*""".r
   private def snapshotMetadata(persistenceId: String, revCommit: RevCommit): SnapshotMetadata = {
     val sequenceNr = revCommit.getShortMessage match {
-      case commitMessage(seq) => Integer.parseInt(seq)
+      case commitMessage(seq) => Try { Integer.parseInt(seq) } getOrElse { 0 }
       case _ => 0
     }
     SnapshotMetadata(
@@ -96,14 +105,13 @@ class JgitSnapshotStore(config: Config) extends SnapshotStore with ActorLogging 
     )
   }
 
-  private def selectMetadata(persistenceId: String, criteria: SnapshotSelectionCriteria, maxLoad: Int): Try[List[(String, SnapshotMetadata)]] = withRepository { repo =>
+  private def selectMetadata(persistenceId: String, criteria: SnapshotSelectionCriteria, maxLoad: Int): Try[Stream[(String, SnapshotMetadata)]] = withRepository { repo =>
     repo.withFileHistory(branchName = branch(persistenceId), entryName = ENTRY_NAME) { commits => Try {
-      commits.toStream
+      commits
         .map { revCommit => revCommit.name() -> snapshotMetadata(persistenceId, revCommit) }
         .dropWhile { case (nm, md) => md.timestamp > criteria.maxTimestamp || md.sequenceNr > criteria.maxSequenceNr }
         .takeWhile { case (nm, md) => md.timestamp >= criteria.minTimestamp && md.sequenceNr >= criteria.minSequenceNr }
         .take(maxLoad)
-        .toList
     } }
   }
 

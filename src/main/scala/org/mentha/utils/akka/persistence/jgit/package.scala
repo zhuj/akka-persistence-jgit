@@ -30,23 +30,22 @@ package object jgit {
   @inline def withResource[Resource<:AutoCloseable, Res](r: Resource)(body: Resource=>Try[Res]): Try[Res] =
     withObject[Resource, Res](r, _.close(), body)
 
-  // TODO: see https://github.com/centic9/jgit-cookbook
-  // TODO: try http://download.eclipse.org/jgit/site/4.7.1.201706071930-r/apidocs/org/eclipse/jgit/internal/storage/dfs/InMemoryRepository.html
-
+  /**
+    * @see [[https://github.com/centic9/jgit-cookbook]]
+    * @see [[https://www.kenneth-truyers.net/2016/10/13/git-nosql-database/]]
+    */
   implicit class ImplicitRepository(repo: Repository) {
 
-    def withFileHistory[T](branchName: String, entryName: String)(body: Iterator[RevCommit] => Try[T]): Try[T] = {
+    def withFileHistory[T](branchName: String, entryName: String)(body: Stream[RevCommit] => Try[T]): Try[T] = {
       val headId: ObjectId = repo.resolve(Constants.R_HEADS + branchName + "^{commit}")
       if (null == headId) {
-        body { Iterator.empty }
+        body { Stream.Empty }
       } else {
         withResource(new RevWalk(repo)) { revWalk =>
           revWalk.markStart(revWalk.parseCommit(headId))
           revWalk.setTreeFilter(PathFilterGroup.createFromStrings(entryName))
           revWalk.sort(RevSort.COMMIT_TIME_DESC)
-          body {
-            collection.JavaConverters.asScalaIterator(revWalk.iterator())
-          }
+          body { collection.JavaConverters.asScalaIterator(revWalk.iterator()).toStream }
         }
       }
     }
@@ -147,7 +146,6 @@ package object jgit {
         }
       }
     }
-
   }
 
 }
