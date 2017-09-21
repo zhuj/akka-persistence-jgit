@@ -1,32 +1,24 @@
 package org.mentha.utils.akka.persistence.jgit.snapshot
 
 import java.io._
-import java.nio.charset.Charset
 import java.util.Date
 
 import akka.actor.ActorLogging
 import akka.persistence._
+import akka.persistence.serialization.{Snapshot, streamToBytes}
 import akka.persistence.snapshot.SnapshotStore
+import akka.serialization._
 import com.typesafe.config.Config
-import org.eclipse.jgit.dircache.{DirCache, DirCacheEntry}
 import org.eclipse.jgit.lib._
 import org.eclipse.jgit.revwalk._
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder
-import org.eclipse.jgit.treewalk.CanonicalTreeParser
 import org.eclipse.jgit.util.SystemReader
 import org.mentha.utils.akka.persistence.jgit._
-import play.api.libs.json.{JsObject, JsValue, Json}
 
-import scala.collection.mutable
 import scala.concurrent.Future
 import scala.util._
 
-class JgitJsonSnapshotStore(config: Config) extends SnapshotStore with ActorLogging {
-
-  protected sealed trait NodeType {}
-  protected case object NodeTypeFolder extends NodeType {}
-  protected case object NodeTypeFile extends NodeType {}
-  protected case object NodeTypeProperty extends NodeType {}
+class JgitSnapshotStore(config: Config) extends SnapshotStore with ActorLogging {
 
   // debug
   @inline private def time[R](name: String)(block: => R): R = {
@@ -41,8 +33,6 @@ class JgitJsonSnapshotStore(config: Config) extends SnapshotStore with ActorLogg
     }
   }
 
-  private val UTF8 = Charset.forName("UTF-8")
-
   import akka.util.Helpers._
   private val maxLoadAttempts = config.getInt("max-load-attempts").requiring(_ > 1, "max-load-attempts must be >= 1")
 
@@ -54,34 +44,24 @@ class JgitJsonSnapshotStore(config: Config) extends SnapshotStore with ActorLogg
     org.eclipse.jgit.api.Git.init().setDirectory(dir).call()
   }
 
-  private val snapshotPrettyFormat: Boolean = config.getBoolean("pretty")
-
   private val branchPrefix = new File(config.getString("branch-prefix"))
   private val executionContext = context.system.dispatchers.lookup(config.getString("stream-dispatcher"))
+  private val serializationExtension = SerializationExtension(context.system)
 
   private val commiterName = config.getString("commiter.name")
   private val commiterMail = config.getString("commiter.mail")
 
-  protected val OBJECT_JSON = ".object.json"
+  private val ENTRY_NAME = "SNAPSHOT"
 
   override def loadAsync(persistenceId: String, criteria: SnapshotSelectionCriteria): Future[Option[SelectedSnapshot]] = {
     Future {
-      time("loadAsync") {
-        selectMetadata(persistenceId, criteria, maxLoadAttempts)
-          .flatMap { loadFirstSuccess }
-          .get
-      }
+      time("loadAsync") { selectMetadata(persistenceId, criteria, maxLoadAttempts).flatMap { loadFirstSuccess }.get }
     }(executionContext)
   }
 
   override def saveAsync(metadata: SnapshotMetadata, snapshot: Any): Future[Unit] = {
     Future {
-      time("saveAsync") {
-        save(metadata, snapshot.asInstanceOf[JsObject])
-          .recoverWith { case e => log.error(e, e.getMessage); Failure(e) }
-          .map { _ => }
-          .get
-      }
+      time("saveAsync") { save(metadata, snapshot).map { _ => }.get }
     }(executionContext)
   }
 
@@ -99,8 +79,8 @@ class JgitJsonSnapshotStore(config: Config) extends SnapshotStore with ActorLogg
   private def loadFirstSuccess(metadata: Stream[(String, SnapshotMetadata)]): Try[Option[SelectedSnapshot]] = metadata match {
     case Stream.Empty => Success(None) // no snapshots stored
     case (rev, md) #:: remaining ⇒ {
-      tryToLoad(md.persistenceId, rev) match {
-        case Success(s) => Success(Some(SelectedSnapshot(md, s)))
+      tryToLoad(md.persistenceId, rev)(deserialize) match {
+        case Success(s) => Success(Some(SelectedSnapshot(md, s.data)))
         case Failure(e) => {
           log.error(e, s"Error loading snapshot [{}], remaining attempts: [{}]", md, remaining.size)
           if (remaining.isEmpty) { Failure(e) } // all attempts failed
@@ -110,61 +90,22 @@ class JgitJsonSnapshotStore(config: Config) extends SnapshotStore with ActorLogg
     }
   }
 
-  protected def getNodeType(path: String, name: String, value: JsValue): NodeType = {
-    if (OBJECT_JSON == name) { throw new IllegalStateException() }
-    else { NodeTypeFile }
-  }
-
-  protected def save(metadata: SnapshotMetadata, snapshot: JsObject): Try[RefUpdate.Result] = withRepository { repo =>
-    val commiter = new PersonIdent(commiterName, commiterMail, metadata.timestamp, SystemReader.getInstance.getTimezone(metadata.timestamp))
-    val time = commiter.getWhen.getTime
-    repo.commitBranchTree(
+  protected def save(metadata: SnapshotMetadata, snapshot: Any): Try[RefUpdate.Result] = withRepository { repo =>
+    repo.commitBranchEntry(
       branchName = branch(metadata.persistenceId),
-      commiter = commiter,
+      commiter = new PersonIdent(commiterName, commiterMail, metadata.timestamp, SystemReader.getInstance.getTimezone(metadata.timestamp)),
       message = s"[${metadata.sequenceNr}]: Snapshot stored ${new Date(metadata.timestamp).toString}"
-    ) {
-      (obi) => Try {
-
-        val dc = DirCache.newInCore()
-        val builder = dc.builder()
-
-        def insert(obj: JsValue, path: String) = {
-          val text = if (snapshotPrettyFormat) { Json.prettyPrint(obj) } else { Json.stringify(obj) }
-          val fileContentBlobId = obi.insert(Constants.OBJ_BLOB, text.getBytes(UTF8))
-
-          val entry = new DirCacheEntry(path)
-          entry.setLength(text.length)
-          entry.setFileMode(FileMode.REGULAR_FILE)
-          entry.setObjectId(fileContentBlobId)
-          entry.setLastModified(time)
-
-          builder.add(entry)
-        }
-
-        @inline def concat(path: String, name: String) = if (path.isEmpty) { name } else { path + '/' + name }
-
-        def withObject(obj: JsObject, path: String): Unit = {
-          val c = mutable.LinkedHashMap.empty[String, JsValue]
-          for { (name, value) <- obj.fields } {
-            getNodeType(path, name, value) match {
-              case NodeTypeFolder => withObject(value.asInstanceOf[JsObject], concat(path, name))
-              case NodeTypeFile => insert(value, concat(path, name))
-              case _ => c += (name -> value)
-            }
-          }
-          if (c.nonEmpty) {
-            insert(JsObject(c), concat(path, OBJECT_JSON))
-          }
-        }
-
-        withObject(snapshot, "")
-
-        builder.finish()
-        dc.writeTree(obi)
-      }
-    }
+    )(
+      entryName = ENTRY_NAME,
+      bytes = serialize(Snapshot(snapshot))
+    )
   }
 
+  protected def deserialize(inputStream: InputStream): Snapshot =
+    serializationExtension.deserialize(streamToBytes(inputStream), classOf[Snapshot]).get
+
+  protected def serialize(snapshot: Snapshot): Array[Byte] =
+    serializationExtension.findSerializerFor(snapshot).toBinary(snapshot)
 
   private val commitMessage = """\[(\d+)\].*""".r
   private def snapshotMetadata(persistenceId: String, revCommit: RevCommit): SnapshotMetadata = {
@@ -180,7 +121,7 @@ class JgitJsonSnapshotStore(config: Config) extends SnapshotStore with ActorLogg
   }
 
   private def selectMetadata(persistenceId: String, criteria: SnapshotSelectionCriteria, maxLoad: Int): Try[Stream[(String, SnapshotMetadata)]] = withRepository { repo =>
-    repo.withBranchHistory(branchName = branch(persistenceId)) { commits => Try {
+    repo.withFileHistory(branchName = branch(persistenceId), entryName = ENTRY_NAME) { commits => Try {
       commits
         // .take(maxLoad)
         .map { revCommit => revCommit.name() -> snapshotMetadata(persistenceId, revCommit) }
@@ -190,51 +131,8 @@ class JgitJsonSnapshotStore(config: Config) extends SnapshotStore with ActorLogg
     } }
   }
 
-  private def tryToLoad(persistenceId: String, rev: String): Try[JsObject] = withRepository { repo =>
-    val branchName = branch(persistenceId)
-    val commitId = repo.resolve(Constants.R_HEADS + branchName + "^{commit}")
-    if (null == commitId) {
-      Success {
-        JsObject.empty
-      }
-    } else {
-
-      withResource(new RevWalk(repo)) { revWalk =>
-        val commit = revWalk.parseCommit(commitId)
-        withResource(repo.newObjectReader()) { reader =>
-
-          def withTree(tree: ObjectId): JsObject = {
-            val c = mutable.LinkedHashMap.empty[String, JsValue]
-
-            val p = new CanonicalTreeParser()
-            p.reset(reader, tree)
-            while (!p.eof()) {
-              val name = p.getEntryPathString
-              val value = if (p.getEntryFileMode == FileMode.TREE) {
-                withTree(p.getEntryObjectId)
-              } else {
-                val loader = repo.open(p.getEntryObjectId)
-                withResource(loader.openStream()) { stream => Try { Json.parse(stream).asInstanceOf[JsObject] } } .get
-              }
-
-              if (OBJECT_JSON != name) {
-                c += (name -> value)
-              } else {
-                c ++= value.fields
-              }
-
-              p.next()
-            }
-
-            new JsObject(c)
-          }
-
-          Try {
-            withTree(commit.getTree)
-          }
-        }
-      }
-    }
+  private def tryToLoad[T](persistenceId: String, rev: String)(p: (InputStream) ⇒ T): Try[T] = withRepository { repo =>
+    repo.withFileContent(branchName = branch(persistenceId), entryName = ENTRY_NAME)(rev = rev) { stream => Try { p(stream) } }
   }
 
   private def branch(persistenceId: String) = s"${branchPrefix}-${persistenceId}"
