@@ -2,19 +2,16 @@ import java.io.File
 import java.nio.charset.Charset
 
 import org.apache.commons.io.IOUtils
-import org.eclipse.jgit.api.Git
 import org.eclipse.jgit.lib.PersonIdent
 
 import scala.util.Success
 
 object test {
   import org.eclipse.jgit.storage.file.FileRepositoryBuilder
-  import org.metha.utils.akka.persistence.jgit._
+  import org.mentha.utils.akka.persistence.jgit._
   def main(args: Array[String]): Unit = {
 
 
-    // val P = "/opt/projects/W-LOCAL/akka-persistence-cassandra"
-    // val P = "/opt/projects/W-LOCAL/akka-persistence-jgit/test"
     val P = "./test"
 
     withResource(
@@ -24,10 +21,10 @@ object test {
     ) { repo =>
 
       val commiter = new PersonIdent("qwe", "qwe@mail")
-      repo.commitBranchEntry("branch1", "tmp1", commiter, s"[${System.nanoTime()}] test commit - 1.1")(s"test content ${System.nanoTime()}".getBytes).get
-      repo.commitBranchEntry("branch1", "tmp2", commiter, s"[${System.nanoTime()}] test commit - 1.2")(s"test content ${System.nanoTime()}".getBytes).get
-      repo.commitBranchEntry("branch2", "tmp1", commiter, s"[${System.nanoTime()}] test commit - 2.1")(s"test content ${System.nanoTime()}".getBytes).get
-      repo.commitBranchEntry("branch2", "tmp3", commiter, s"[${System.nanoTime()}] test commit - 2.3")(s"test content ${System.nanoTime()}".getBytes).get
+      repo.commitBranchEntry("branch1", commiter, s"[${System.nanoTime()}] test commit - 1.1")("tmp1", s"test content ${System.nanoTime()}".getBytes).get
+      repo.commitBranchEntry("branch1", commiter, s"[${System.nanoTime()}] test commit - 1.2")("tmp2", s"test content ${System.nanoTime()}".getBytes).get
+      repo.commitBranchEntry("branch2", commiter, s"[${System.nanoTime()}] test commit - 2.1")("tmp1", s"test content ${System.nanoTime()}".getBytes).get
+      repo.commitBranchEntry("branch2", commiter, s"[${System.nanoTime()}] test commit - 2.3")("tmp3", s"test content ${System.nanoTime()}".getBytes).get
 
       repo.withFileHistory("branch1", "tmp1") { commits =>
         Success {
